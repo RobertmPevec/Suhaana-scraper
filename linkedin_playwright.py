@@ -28,6 +28,9 @@ class BatchSummaries(BaseModel):
     summaries: list[str] = Field(
         description="List of concise 1-2 sentence summaries, one per post in the same order they were provided."
     )
+    categories: list[str] = Field(
+        description="List of event categories, one per post in the same order. Must be one of: 'Conferences / Keynotes / Webinars', 'Financial Events', 'Corporate Milestones', 'Community Engagement / Sponsorships', 'Career Fairs / Student Events', 'Celebrations', or 'N/A' if the post is not about an event."
+    )
 
 
 
@@ -264,16 +267,16 @@ async def scrape_linkedin_posts(company_url: str, months_back: int) -> list[dict
 SUMMARY_CHUNK_SIZE = 10
 
 
-def generate_summaries_batch(post_texts: list[str]) -> list[str]:
-    """Generate summaries for up to 5 posts in a single Gemini call."""
+def generate_summaries_batch(post_texts: list[str], post_ages: list[str]) -> list[str]:
+    """Generate summaries for up to 10 posts in a single Gemini call."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return [""] * len(post_texts)
 
-    # Build numbered prompt
+    # Build numbered prompt with ages so Gemini can calculate dates
     numbered_posts = ""
-    for i, text in enumerate(post_texts, 1):
-        numbered_posts += f"Post {i}:\n{text}\n\n"
+    for i, (text, age) in enumerate(zip(post_texts, post_ages), 1):
+        numbered_posts += f"Post {i} (posted {age} ago):\n{text}\n\n"
 
     client = genai.Client(api_key=api_key)
 
@@ -289,11 +292,15 @@ def generate_summaries_batch(post_texts: list[str]) -> list[str]:
                     "Return exactly one summary per post, in the same order."
                 ),
             },
-            contents=f"""Today's date is {datetime.now().strftime('%B %d, %Y')}. For each of the following {len(post_texts)} LinkedIn posts, read each post properly and format it as THREE SEPARATE LINES using newline characters (\\n):
+            contents=f"""Today's date is {datetime.now().strftime('%B %d, %Y')}. Each post includes how long ago it was posted (e.g. "1w ago", "2mo ago"). Use today's date and the post age to calculate the approximate date of the post/event. For example, if today is April 1, 2026 and a post was "1w ago", the post date is approximately March 25, 2026.
 
-LINE 1: Date – Event Name – Location (use – dashes to separate)
-LINE 2: One simple sentence explaining the event.
-LINE 3: CATEGORY: followed by one of: Conferences / Keynotes / Webinars, Financial Events, Corporate Milestones, Community Engagement / Sponsorships, Career Fairs / Student Events, Celebrations
+For each of the following {len(post_texts)} LinkedIn posts, read each post properly and provide TWO outputs:
+
+1. A "summary" formatted as TWO SEPARATE LINES using newline characters (\\n):
+   LINE 1: Calculated Date – Event Name – Location (use – dashes to separate. Use the calculated date, not the relative age.)
+   LINE 2: One simple sentence explaining the event.
+
+2. A "category" — one of: Conferences / Keynotes / Webinars, Financial Events, Corporate Milestones, Community Engagement / Sponsorships, Career Fairs / Student Events, Celebrations, or N/A if not an event.
 
 IMPORTANT: Each line MUST be separated by a newline character (\\n). Do NOT put everything on one line.
 
@@ -303,29 +310,29 @@ Examples of good responses:
 
 "December 2025 – Roberto Rocca After School Showcase – Pindamonhangaba, Brazil
 Students from Escola Isabel do Carmo Nogueira presented robotics projects developed to solve real school challenges, marking the conclusion of the learning cycle.
-CATEGORY: Community Engagement / Sponsorships"
 
 "December 2025 – Roberto Rocca Technical School Graduation Session – Campana, Argentina
 Ahead of their graduation, the Class of 2025 met with Southern Cone President Andrea Previtali to discuss career development, Industry 4.0 skills, and the impact of AI.
-CATEGORY: Career Fairs / Student Events"
 
 "January 2026 – Chevron Houston Marathon Volunteering – Houston, Texas
 For the 13th consecutive year, 60 Tenaris team members volunteered to support runners with refreshments and cheering along the marathon course.
-CATEGORY: Community Engagement / Sponsorships"
 
 {numbered_posts}""",
         )
 
         result = BatchSummaries.model_validate_json(resp.text)
 
-        # Ensure we have the right number of summaries
+        # Ensure we have the right number of summaries and categories
         summaries = result.summaries
+        categories = result.categories
         while len(summaries) < len(post_texts):
             summaries.append("")
-        return summaries[:len(post_texts)]
+        while len(categories) < len(post_texts):
+            categories.append("N/A")
+        return summaries[:len(post_texts)], categories[:len(post_texts)]
     except Exception as e:
-        print(f"    [!] Gemini error: {e}. Filling summaries as empty.")
-        return [""] * len(post_texts)
+        print(f"    [!] Gemini error: {e}. Filling as empty.")
+        return [""] * len(post_texts), ["N/A"] * len(post_texts)
 
 
 # ── Excel Export ─────────────────────────────────────────────────────────────
@@ -341,7 +348,7 @@ def save_to_excel(posts: list[dict], company_url: str) -> str:
     ws = wb.active
     ws.title = "LinkedIn Posts"
 
-    headers = ["Post Age", "Full Content", "Summary", "Post Link"]
+    headers = ["Post Age", "Full Content", "Summary", "Category", "Post Link"]
     header_font = Font(bold=True, size=12)
     for col, header in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col, value=header)
@@ -368,7 +375,8 @@ def save_to_excel(posts: list[dict], company_url: str) -> str:
             ws.cell(row=row_idx, column=3, value=summary)
 
         ws.cell(row=row_idx, column=3).alignment = Alignment(wrap_text=True)
-        ws.cell(row=row_idx, column=4, value=post.get("link", ""))
+        ws.cell(row=row_idx, column=4, value=post.get("category", ""))
+        ws.cell(row=row_idx, column=5, value=post.get("link", ""))
 
     for col_idx, header in enumerate(headers, 1):
         max_len = len(header)
@@ -410,13 +418,15 @@ async def _standalone_main():
 
             print(f"  Batch {batch_num}/{total_batches} ({len(batch)} posts)...")
             texts = [raw["text"] for raw in batch]
-            summaries = generate_summaries_batch(texts)
+            ages = [raw["age"] for raw in batch]
+            summaries, categories = generate_summaries_batch(texts, ages)
 
-            for raw, summary in zip(batch, summaries):
+            for raw, summary, category in zip(batch, summaries, categories):
                 posts.append({
                     "age": raw["age"],
                     "content": raw["text"],
                     "summary": summary,
+                    "category": category,
                     "link": raw["url"],
                 })
     else:
@@ -426,6 +436,7 @@ async def _standalone_main():
                 "age": raw["age"],
                 "content": raw["text"],
                 "summary": "",
+                "category": "",
                 "link": raw["url"],
             })
 
