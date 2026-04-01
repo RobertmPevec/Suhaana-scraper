@@ -10,6 +10,8 @@ from google import genai
 from pydantic import BaseModel, Field
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
+from openpyxl.cell.rich_text import TextBlock, CellRichText
+from openpyxl.cell.text import InlineFont
 
 load_dotenv()
 
@@ -26,6 +28,8 @@ class BatchSummaries(BaseModel):
     summaries: list[str] = Field(
         description="List of concise 1-2 sentence summaries, one per post in the same order they were provided."
     )
+
+
 
 
 # ── Helper: Parse LinkedIn post age into months ──────────────────────────────
@@ -220,12 +224,31 @@ async def scrape_linkedin_posts(company_url: str, months_back: int) -> list[dict
             if stop_scraping:
                 break
 
-            # Scroll down realistically
+            # Scroll down like a real human with a mouse wheel
             scroll_count += 1
-            scroll_amount = random.randint(800, 1200)
-            await page.mouse.wheel(0, scroll_amount)
-            wait_time = random.uniform(1.5, 3.0)
-            await asyncio.sleep(wait_time)
+
+            # Occasionally scroll up a little (like re-reading something)
+            if random.random() < 0.15:
+                for _ in range(random.randint(2, 5)):
+                    await page.mouse.wheel(0, -random.randint(30, 80))
+                    await asyncio.sleep(random.uniform(0.02, 0.08))
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+
+            # Simulate real mouse wheel: many small ticks with tiny delays
+            total_scroll = random.randint(400, 900)
+            tick_size = random.randint(40, 100)  # Each wheel tick
+            scrolled = 0
+            while scrolled < total_scroll:
+                tick = min(tick_size + random.randint(-15, 15), total_scroll - scrolled)
+                await page.mouse.wheel(0, tick)
+                await asyncio.sleep(random.uniform(0.015, 0.06))  # Tiny gap between ticks
+                scrolled += tick
+
+            # Pause after scrolling — sometimes longer (reading a post)
+            if random.random() < 0.2:
+                await asyncio.sleep(random.uniform(4.0, 8.0))
+            else:
+                await asyncio.sleep(random.uniform(2.0, 4.0))
 
             if scroll_count % 5 == 0:
                 print(f"  Scrolled {scroll_count} times, {len(posts)} posts so far...")
@@ -238,7 +261,7 @@ async def scrape_linkedin_posts(company_url: str, months_back: int) -> list[dict
 
 # ── Gemini: Generate Summaries (batch of 5) ──────────────────────────────────
 
-SUMMARY_CHUNK_SIZE = 5
+SUMMARY_CHUNK_SIZE = 10
 
 
 def generate_summaries_batch(post_texts: list[str]) -> list[str]:
@@ -266,7 +289,31 @@ def generate_summaries_batch(post_texts: list[str]) -> list[str]:
                     "Return exactly one summary per post, in the same order."
                 ),
             },
-            contents=f"Summarize each of the following {len(post_texts)} LinkedIn posts in 1-2 sentences each:\n\n{numbered_posts}",
+            contents=f"""Today's date is {datetime.now().strftime('%B %d, %Y')}. For each of the following {len(post_texts)} LinkedIn posts, read each post properly and format it as THREE SEPARATE LINES using newline characters (\\n):
+
+LINE 1: Date – Event Name – Location (use – dashes to separate)
+LINE 2: One simple sentence explaining the event.
+LINE 3: CATEGORY: followed by one of: Conferences / Keynotes / Webinars, Financial Events, Corporate Milestones, Community Engagement / Sponsorships, Career Fairs / Student Events, Celebrations
+
+IMPORTANT: Each line MUST be separated by a newline character (\\n). Do NOT put everything on one line.
+
+BELOW THAT TELL ME WHICH CATEGORY THE EVENT WOULD FALL UNDER HERE ARE SOME EXAMPLES OF WHAT IT COULD BE Conferences / Keynotes / wEBINARS  / Financial Events / Corporate Milestones / Community Engagement / Sponsorships
+
+Examples of good responses:
+
+"December 2025 – Roberto Rocca After School Showcase – Pindamonhangaba, Brazil
+Students from Escola Isabel do Carmo Nogueira presented robotics projects developed to solve real school challenges, marking the conclusion of the learning cycle.
+CATEGORY: Community Engagement / Sponsorships"
+
+"December 2025 – Roberto Rocca Technical School Graduation Session – Campana, Argentina
+Ahead of their graduation, the Class of 2025 met with Southern Cone President Andrea Previtali to discuss career development, Industry 4.0 skills, and the impact of AI.
+CATEGORY: Career Fairs / Student Events"
+
+"January 2026 – Chevron Houston Marathon Volunteering – Houston, Texas
+For the 13th consecutive year, 60 Tenaris team members volunteered to support runners with refreshments and cheering along the marathon course.
+CATEGORY: Community Engagement / Sponsorships"
+
+{numbered_posts}""",
         )
 
         result = BatchSummaries.model_validate_json(resp.text)
@@ -301,10 +348,26 @@ def save_to_excel(posts: list[dict], company_url: str) -> str:
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center")
 
+    bold_font = InlineFont(b=True)
+    normal_font = InlineFont()
+
     for row_idx, post in enumerate(posts, 2):
         ws.cell(row=row_idx, column=1, value=post.get("age", ""))
         ws.cell(row=row_idx, column=2, value=post.get("content", ""))
-        ws.cell(row=row_idx, column=3, value=post.get("summary", ""))
+
+        # Format summary: first line bold, rest normal
+        summary = post.get("summary", "")
+        if summary and "\n" in summary:
+            lines = summary.split("\n", 1)
+            rich_text = CellRichText(
+                TextBlock(bold_font, lines[0]),
+                TextBlock(normal_font, "\n" + lines[1]),
+            )
+            ws.cell(row=row_idx, column=3).value = rich_text
+        else:
+            ws.cell(row=row_idx, column=3, value=summary)
+
+        ws.cell(row=row_idx, column=3).alignment = Alignment(wrap_text=True)
         ws.cell(row=row_idx, column=4, value=post.get("link", ""))
 
     for col_idx, header in enumerate(headers, 1):
@@ -339,11 +402,11 @@ async def _standalone_main():
     # Step 2: Generate summaries if requested
     posts = []
     if use_summary:
+        total_batches = (len(raw_posts) + SUMMARY_CHUNK_SIZE - 1) // SUMMARY_CHUNK_SIZE
         print(f"\nGenerating summaries for {len(raw_posts)} posts ({SUMMARY_CHUNK_SIZE} at a time)...")
         for batch_start in range(0, len(raw_posts), SUMMARY_CHUNK_SIZE):
             batch = raw_posts[batch_start:batch_start + SUMMARY_CHUNK_SIZE]
             batch_num = (batch_start // SUMMARY_CHUNK_SIZE) + 1
-            total_batches = (len(raw_posts) + SUMMARY_CHUNK_SIZE - 1) // SUMMARY_CHUNK_SIZE
 
             print(f"  Batch {batch_num}/{total_batches} ({len(batch)} posts)...")
             texts = [raw["text"] for raw in batch]
