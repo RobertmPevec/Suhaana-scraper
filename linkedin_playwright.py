@@ -254,27 +254,31 @@ def generate_summaries_batch(post_texts: list[str]) -> list[str]:
 
     client = genai.Client(api_key=api_key)
 
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        config={
-            "response_mime_type": "application/json",
-            "response_schema": BatchSummaries,
-            "system_instruction": (
-                "You summarize LinkedIn posts concisely. "
-                "Output ONLY valid JSON matching the schema. "
-                "Return exactly one summary per post, in the same order."
-            ),
-        },
-        contents=f"Summarize each of the following {len(post_texts)} LinkedIn posts in 1-2 sentences each:\n\n{numbered_posts}",
-    )
+    try:
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": BatchSummaries,
+                "system_instruction": (
+                    "You summarize LinkedIn posts concisely. "
+                    "Output ONLY valid JSON matching the schema. "
+                    "Return exactly one summary per post, in the same order."
+                ),
+            },
+            contents=f"Summarize each of the following {len(post_texts)} LinkedIn posts in 1-2 sentences each:\n\n{numbered_posts}",
+        )
 
-    result = BatchSummaries.model_validate_json(resp.text)
+        result = BatchSummaries.model_validate_json(resp.text)
 
-    # Ensure we have the right number of summaries
-    summaries = result.summaries
-    while len(summaries) < len(post_texts):
-        summaries.append("")
-    return summaries[:len(post_texts)]
+        # Ensure we have the right number of summaries
+        summaries = result.summaries
+        while len(summaries) < len(post_texts):
+            summaries.append("")
+        return summaries[:len(post_texts)]
+    except Exception as e:
+        print(f"    [!] Gemini error: {e}. Filling summaries as empty.")
+        return [""] * len(post_texts)
 
 
 # ── Excel Export ─────────────────────────────────────────────────────────────
@@ -324,6 +328,7 @@ async def _standalone_main():
     company_url = input("Enter LinkedIn company URL: ").strip()
     months_back = input("How many months back? ").strip()
     months_back = int(months_back) if months_back else 3
+    use_summary = input("Generate Gemini summaries? (yes/no): ").strip().lower() == "yes"
 
     # Step 1: Scrape posts
     raw_posts = await scrape_linkedin_posts(company_url, months_back)
@@ -331,23 +336,33 @@ async def _standalone_main():
         print("\n⚠️  No posts found.")
         return
 
-    # Step 2: Generate summaries in batches of 5
-    print(f"\nGenerating summaries for {len(raw_posts)} posts ({SUMMARY_CHUNK_SIZE} at a time)...")
+    # Step 2: Generate summaries if requested
     posts = []
-    for batch_start in range(0, len(raw_posts), SUMMARY_CHUNK_SIZE):
-        batch = raw_posts[batch_start:batch_start + SUMMARY_CHUNK_SIZE]
-        batch_num = (batch_start // SUMMARY_CHUNK_SIZE) + 1
-        total_batches = (len(raw_posts) + SUMMARY_CHUNK_SIZE - 1) // SUMMARY_CHUNK_SIZE
+    if use_summary:
+        print(f"\nGenerating summaries for {len(raw_posts)} posts ({SUMMARY_CHUNK_SIZE} at a time)...")
+        for batch_start in range(0, len(raw_posts), SUMMARY_CHUNK_SIZE):
+            batch = raw_posts[batch_start:batch_start + SUMMARY_CHUNK_SIZE]
+            batch_num = (batch_start // SUMMARY_CHUNK_SIZE) + 1
+            total_batches = (len(raw_posts) + SUMMARY_CHUNK_SIZE - 1) // SUMMARY_CHUNK_SIZE
 
-        print(f"  Batch {batch_num}/{total_batches} ({len(batch)} posts)...")
-        texts = [raw["text"] for raw in batch]
-        summaries = generate_summaries_batch(texts)
+            print(f"  Batch {batch_num}/{total_batches} ({len(batch)} posts)...")
+            texts = [raw["text"] for raw in batch]
+            summaries = generate_summaries_batch(texts)
 
-        for raw, summary in zip(batch, summaries):
+            for raw, summary in zip(batch, summaries):
+                posts.append({
+                    "age": raw["age"],
+                    "content": raw["text"],
+                    "summary": summary,
+                    "link": raw["url"],
+                })
+    else:
+        print("\nSkipping summaries.")
+        for raw in raw_posts:
             posts.append({
                 "age": raw["age"],
                 "content": raw["text"],
-                "summary": summary,
+                "summary": "",
                 "link": raw["url"],
             })
 
