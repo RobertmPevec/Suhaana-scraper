@@ -1,0 +1,6 @@
+crawl4ai
+google-generativeai
+openpyxl
+python-dotenv
+pydantic
+requests
